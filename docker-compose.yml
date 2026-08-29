@@ -1,0 +1,171 @@
+# Spec 25.1 - one-command local stack.
+# Topology: nginx load-balances two stateless API replicas; PostgreSQL is the
+# single source of financial truth; Redis holds only ephemeral limits/cache;
+# RabbitMQ carries post-commit events published by the outbox relay.
+
+# Addresses of services on the compose network are written literally rather
+# than interpolated from ${...}. Interpolation is resolved from whichever .env
+# Compose finds for the invoking directory, so running `docker compose` from a
+# subdirectory silently substituted a developer's localhost URLs and the API
+# came up unable to reach Redis. These are network topology, not secrets; the
+# secrets still come from env_file.
+x-api-env: &api-env
+  DATABASE_URL: postgresql+psycopg://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  MIGRATION_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  REDIS_URL: redis://redis:6379/0
+  RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
+  JWT_SECRET: ${JWT_SECRET}
+  ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS}
+  REFRESH_TOKEN_TTL_SECONDS: ${REFRESH_TOKEN_TTL_SECONDS}
+  ENVIRONMENT: ${ENVIRONMENT}
+  LOG_LEVEL: ${LOG_LEVEL}
+  ENGINEERING_API_KEY: ${ENGINEERING_API_KEY}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports: ["5432:5432"]
+    command: >
+      postgres
+      -c max_connections=200
+      -c log_lock_waits=on
+      -c deadlock_timeout=500ms
+      -c statement_timeout=10s
+      -c idle_in_transaction_session_timeout=15s
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    ports: ["5672:5672", "15672:15672"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    image: money-movement-backend:latest
+    build: ./backend
+    env_file: [.env]
+    environment: *api-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  # Two stateless replicas behind nginx (spec 17.1). They are replicas of one
+  # service rather than two named services so Docker's DNS returns both
+  # addresses under a single name and nginx can discover them at runtime.
+  # INSTANCE_ID is left unset; each container reports its own hostname, which
+  # is how the demo shows requests landing on different replicas.
+  api:
+    image: money-movement-backend:latest
+    build: ./backend
+    env_file: [.env]
+    environment: *api-env
+    deploy:
+      replicas: 2
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+    expose: ["8000"]
+    restart: unless-stopped
+
+  outbox-relay:
+    image: money-movement-backend:latest
+    env_file: [.env]
+    environment:
+      <<: *api-env
+      INSTANCE_ID: outbox-relay
+    command: ["python", "-m", "apps.outbox_relay.main"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlalchemy,os; sqlalchemy.create_engine(os.environ['DATABASE_URL']).connect().close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      postgres: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+
+  notification-worker:
+    image: money-movement-backend:latest
+    env_file: [.env]
+    environment:
+      <<: *api-env
+      INSTANCE_ID: notification-worker
+    command: ["python", "-m", "apps.notification_worker.main"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlalchemy,os; sqlalchemy.create_engine(os.environ['DATABASE_URL']).connect().close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      postgres: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+
+  scheduler-worker:
+    image: money-movement-backend:latest
+    env_file: [.env]
+    environment:
+      <<: *api-env
+      INSTANCE_ID: scheduler-worker
+    command: ["python", "-m", "apps.scheduler_worker.main"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlalchemy,os; sqlalchemy.create_engine(os.environ['DATABASE_URL']).connect().close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      postgres: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    ports: ["8080:80"]
+    depends_on: [api]
+    restart: unless-stopped
+
+  adminer:
+    image: adminer
+    ports: ["8081:8080"]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+volumes:
+  pgdata:

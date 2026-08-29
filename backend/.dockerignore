@@ -1,0 +1,18 @@
+# Never bake local configuration or secrets into the image. Without this the
+# development .env - database passwords, JWT secret, engineering key - is
+# copied in by `COPY . .` and then read in preference to the values the
+# orchestrator injects, so the container silently ignores its real config.
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+tests/
+load_tests/
+.coverage
+htmlcov/
+*.db
